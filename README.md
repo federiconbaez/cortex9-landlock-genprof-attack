@@ -37,11 +37,11 @@ cargo build --release
 
 | App | Fidelidad | Escapes bloqueados | Dónde se midió |
 |---|---|---|---|
-| **demo** (lgpa demo-workload) | **14/14** | **36/41 = 87,8 %** | box + CI |
+| **demo** (lgpa demo-workload) | **14/14** | **36/41 = 87,8 %** | box + CI (ABI 6/8) |
 | **curl** | **2/2** | **35/41 = 85,4 %** | box + CI |
 | **python3 -m http.server** | **2/2** | **35/41 = 85,4 %** | box + CI |
-| **sqlite3** | — | — | **solo CI** (apt de la box no lo instala) |
-| **nginx** | — | — | **solo CI** (apt de la box no lo instala) |
+| **sqlite3** | **2/2** | **36/41 = 87,8 %** | **solo CI** (apt de la box no lo instala) |
+| **nginx** | **2/2** | **37/41 = 90,2 %** | **solo CI** (apt de la box no lo instala) |
 
 Los no bloqueados comunes son límites reales, no skips silenciosos:
 
@@ -127,9 +127,9 @@ de alcance hoy**, justificado uno por uno:
 
 **No probado / limitaciones:**
 
-- **sqlite3 y nginx** no corren en la box (apt mirror 500 / paquete ausente);
-  el job `measure-apps` de CI los instala y mide. Hasta que ese job esté
-  verde en `main`, esos dos números **no existen**.
+- **sqlite3 y nginx** no se pueden instalar en la box (apt mirror 500 /
+  paquete ausente); el job `measure-apps` de CI los instaló y midió
+  (run `40818322394`): sqlite3 87,8 %, nginx 90,2 %.
 - El loader Cortex-9 (`09-elf-zk-loader`) **no** se midió: cablearlo como
   workload de entrenamiento + corpus de bins excede el resto del día.
 - Solo x86_64.
