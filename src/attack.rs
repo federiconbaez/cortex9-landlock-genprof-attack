@@ -468,6 +468,162 @@ fn a_ctrl_write_allowed(c: &Ctx, _: i64) -> Outcome {
     }
 }
 
+fn a_opath_reopen(_c: &Ctx, pre: i64) -> Outcome {
+    // O_PATH fd opened before sandbox; reopen for read via /proc/self/fd.
+    if pre < 0 {
+        return Outcome::Inconclusive;
+    }
+    let p = format!("/proc/self/fd/{pre}");
+    classify(open_ro(&p))
+}
+fn pre_opath_outside(c: &Ctx) -> i64 {
+    unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            cs(&c.outside_file).as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        )
+    }
+}
+fn a_chmod_outside(c: &Ctx, _: i64) -> Outcome {
+    // Landlock does NOT restrict chmod (kernel docs). Counts as escape when it
+    // succeeds — documents the gap rather than claiming a block.
+    let r = unsafe { libc::syscall(libc::SYS_chmod, cs(&c.outside_file).as_ptr(), 0o644) };
+    classify(r)
+}
+fn a_chown_outside(c: &Ctx, _: i64) -> Outcome {
+    let uid = unsafe { libc::getuid() };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_chown,
+            cs(&c.outside_file).as_ptr(),
+            uid as i64,
+            -1i64,
+        )
+    };
+    classify(r)
+}
+fn a_stat_outside(c: &Ctx, _: i64) -> Outcome {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_stat,
+            cs(&c.outside_file).as_ptr(),
+            &mut st as *mut _,
+        )
+    };
+    classify(r)
+}
+fn a_access_outside(c: &Ctx, _: i64) -> Outcome {
+    let r = unsafe { libc::syscall(libc::SYS_access, cs(&c.outside_file).as_ptr(), libc::R_OK) };
+    classify(r)
+}
+fn a_utimes_outside(c: &Ctx, _: i64) -> Outcome {
+    let r = unsafe { libc::syscall(libc::SYS_utime, cs(&c.outside_file).as_ptr(), 0usize) };
+    classify(r)
+}
+fn a_udp_exfil(c: &Ctx, _: i64) -> Outcome {
+    // UDP to a denied port. Landlock TCP-only until ABI 10; on ABI 6 this is
+    // either blocked by seccomp (if sendto not allowed) or escapes via Landlock.
+    let fd = unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Outcome::Inconclusive;
+    }
+    let sa = sockaddr_in(c.denied_port);
+    let msg = b"exfil";
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_sendto,
+            fd,
+            msg.as_ptr(),
+            msg.len(),
+            0,
+            &sa as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        )
+    };
+    unsafe {
+        libc::syscall(libc::SYS_close, fd);
+    };
+    classify(r)
+}
+fn a_unix_pathname(c: &Ctx, _: i64) -> Outcome {
+    // Pathname UNIX connect. Restricted by Landlock only since ABI 9.
+    let sock = format!("{}/lgpa.sock", c.outside_dir);
+    let fd = unsafe { libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Outcome::Inconclusive;
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as u16;
+    let bytes = sock.as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Outcome::Inconclusive;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = *b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as u32;
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_connect,
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            len,
+        )
+    };
+    unsafe {
+        libc::syscall(libc::SYS_close, fd);
+    };
+    if r >= 0 {
+        return Outcome::Escaped;
+    }
+    match errno() {
+        libc::EACCES | libc::EPERM | SECCOMP_ERRNO => Outcome::Blocked,
+        libc::ECONNREFUSED => Outcome::Escaped,
+        libc::ENOENT => Outcome::Inconclusive,
+        _ => Outcome::Inconclusive,
+    }
+}
+fn a_iouring_openat(c: &Ctx, _: i64) -> Outcome {
+    // io_uring_setup as a stand-in for IORING_OP_OPENAT: if setup is allowed
+    // the attack surface is open. Full SQE submit omitted for day-MVP.
+    #[repr(C)]
+    struct IoUringParams {
+        sq_entries: u32,
+        cq_entries: u32,
+        flags: u32,
+        sq_thread_cpu: u32,
+        sq_thread_idle: u32,
+        features: u32,
+        wq_fd: u32,
+        resv: [u32; 3],
+        sq_off: [u32; 10],
+        cq_off: [u32; 10],
+    }
+    let mut params: IoUringParams = unsafe { std::mem::zeroed() };
+    let ring_fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 2u32, &mut params as *mut _) };
+    if ring_fd < 0 {
+        return classify(ring_fd);
+    }
+    unsafe {
+        libc::syscall(libc::SYS_close, ring_fd);
+    };
+    let _ = c;
+    Outcome::Escaped
+}
+fn a_tiocsti(_: &Ctx, _: i64) -> Outcome {
+    let mut ch: libc::c_char = b'x' as libc::c_char;
+    let r = unsafe { libc::syscall(libc::SYS_ioctl, 0, libc::TIOCSTI, &mut ch as *mut _) };
+    if r < 0 && errno() == SECCOMP_ERRNO {
+        Outcome::Blocked
+    } else {
+        // Reached the kernel (whatever it answered) = surface exposed.
+        Outcome::Escaped
+    }
+}
+
 /// The full catalog.
 pub fn catalog() -> Vec<Attack> {
     vec![
@@ -710,6 +866,86 @@ pub fn catalog() -> Vec<Attack> {
             expect_block: true,
             pre: no_pre,
             post: a_sec_pidfd_getfd,
+        },
+        Attack {
+            id: "opath-reopen",
+            category: "fd-passing",
+            desc: "reopen an O_PATH fd to the secret via /proc/self/fd after sandboxing",
+            expect_block: true,
+            pre: pre_opath_outside,
+            post: a_opath_reopen,
+        },
+        Attack {
+            id: "chmod-outside",
+            category: "landlock-gap",
+            desc: "chmod a file outside (Landlock does not restrict chmod)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_chmod_outside,
+        },
+        Attack {
+            id: "chown-outside",
+            category: "landlock-gap",
+            desc: "chown a file outside (Landlock does not restrict chown)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_chown_outside,
+        },
+        Attack {
+            id: "stat-outside",
+            category: "landlock-gap",
+            desc: "stat a file outside (Landlock does not restrict stat)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_stat_outside,
+        },
+        Attack {
+            id: "access-outside",
+            category: "landlock-gap",
+            desc: "access(2) a file outside (Landlock does not restrict access)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_access_outside,
+        },
+        Attack {
+            id: "utimes-outside",
+            category: "landlock-gap",
+            desc: "utime a file outside (Landlock does not restrict utime)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_utimes_outside,
+        },
+        Attack {
+            id: "udp-exfil",
+            category: "network",
+            desc: "UDP sendto to a denied port (Landlock TCP-only until ABI 10)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_udp_exfil,
+        },
+        Attack {
+            id: "unix-pathname",
+            category: "network",
+            desc: "connect to a pathname UNIX socket outside (RESOLVE_UNIX needs ABI 9)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_unix_pathname,
+        },
+        Attack {
+            id: "iouring-openat",
+            category: "io-uring",
+            desc: "io_uring_setup as a stand-in for IORING_OP_OPENAT against the secret",
+            expect_block: true,
+            pre: no_pre,
+            post: a_iouring_openat,
+        },
+        Attack {
+            id: "tiocsti",
+            category: "tty",
+            desc: "TIOCSTI ioctl on stdin (historically a sandbox escape)",
+            expect_block: true,
+            pre: no_pre,
+            post: a_tiocsti,
         },
         Attack {
             id: "fd-passing",

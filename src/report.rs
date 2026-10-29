@@ -162,6 +162,17 @@ fn run_suite(
                 }
             }
             setup_ws(ws).map_err(|e| e.to_string())?;
+            // Re-bind the pathname UNIX socket after setup_ws wiped outside/.
+            let _sock_guard = std::os::unix::net::UnixListener::bind(
+                std::path::Path::new(&ctx.outside_dir).join("lgpa.sock"),
+            )
+            .ok();
+            // Re-seed the in-sandbox ro file (unlink-ro / truncate-ro destroy it).
+            if let Some(parent) = std::path::Path::new(&ctx.ro_file).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&ctx.ro_file, b"ro\n");
+            let _ = std::fs::create_dir_all(&ctx.rw_dir);
             let o = attack::run_one(profile, *l, ctx, &a);
             outs[i] = Some(o);
             if o == Outcome::HarnessError {
@@ -485,6 +496,240 @@ pub fn measure(ws: &Path, json: Option<PathBuf>, compare: bool, min_blocked_pct:
             "FAIL: blocked {:.1}% < required {min_blocked_pct}%",
             l.blocked_pct
         );
+        return 5;
+    }
+    0
+}
+
+/// Measure every available app from [`crate::apps::APPS`].
+pub fn measure_apps(ws: &Path, json: Option<PathBuf>, min_blocked_pct: f64) -> i32 {
+    use crate::apps;
+    use landlock_genprof_attack::learn;
+
+    let abi = match enforce::landlock_abi() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("FAIL: {e}");
+            return 2;
+        }
+    };
+    if abi < 6 {
+        eprintln!("FAIL: Landlock ABI {abi} < 6");
+        return 2;
+    }
+    let _ = std::fs::create_dir_all(ws);
+    let ws = std::fs::canonicalize(ws).unwrap_or(ws.to_path_buf());
+
+    #[derive(Serialize)]
+    struct AppRow {
+        id: String,
+        title: String,
+        available: bool,
+        skipped_reason: Option<String>,
+        fidelity_ok: u32,
+        fidelity_total: u32,
+        valid_attacks: u32,
+        blocked: u32,
+        blocked_pct: f64,
+        escaped_ids: Vec<String>,
+        profile_syscalls: usize,
+    }
+    #[derive(Serialize)]
+    struct AppsReport {
+        landlock_abi: i32,
+        kernel: String,
+        catalog_size: usize,
+        apps: Vec<AppRow>,
+        reproduce: String,
+    }
+
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut rows = Vec::new();
+
+    for app in apps::APPS {
+        println!("\n######## app: {} ({}) ########", app.id, app.title);
+        if !apps::available(app) {
+            let reason = if app.required_on_box {
+                "REQUIRED binary missing on this host"
+            } else {
+                "optional; not installed on this host (CI installs it)"
+            };
+            eprintln!("SKIP {}: {reason}", app.id);
+            rows.push(AppRow {
+                id: app.id.into(),
+                title: app.title.into(),
+                available: false,
+                skipped_reason: Some(reason.into()),
+                fidelity_ok: 0,
+                fidelity_total: 0,
+                valid_attacks: 0,
+                blocked: 0,
+                blocked_pct: 0.0,
+                escaped_ids: vec![],
+                profile_syscalls: 0,
+            });
+            if app.required_on_box {
+                return 2;
+            }
+            continue;
+        }
+        let app_ws = ws.join(app.id);
+        let _ = std::fs::create_dir_all(&app_ws);
+        // Shared attack workspace (secret/outside/…) lives next to the app dir.
+        let attack_ws = ws.join(format!("{}-attack", app.id));
+        if let Err(e) = setup_ws(&attack_ws) {
+            eprintln!("FAIL setup {}: {e}", app.id);
+            return 2;
+        }
+        let attack_ws = std::fs::canonicalize(&attack_ws).unwrap_or(attack_ws);
+
+        let trace = match apps::trace_app(app, &app_ws) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("FAIL trace {}: {e}", app.id);
+                return 2;
+            }
+        };
+        let profile = learn(&trace);
+        let ppath = app_ws.join("profile.learned.json");
+        let _ = std::fs::write(&ppath, serde_json::to_string_pretty(&profile).unwrap());
+        let _ = std::fs::write(
+            app_ws.join("trace.json"),
+            serde_json::to_string_pretty(&trace).unwrap(),
+        );
+
+        // Fidelity: two runs (fresh + restart).
+        let f1 = match apps::fidelity(app, &app_ws, &ppath, "both") {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("FAIL fidelity1 {}: {e}", app.id);
+                return 4;
+            }
+        };
+        let f2 = match apps::fidelity(app, &app_ws, &ppath, "both") {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("FAIL fidelity2 {}: {e}", app.id);
+                return 4;
+            }
+        };
+        let fid = (f1.0 + f2.0, f1.1 + f2.1);
+        if fid.0 != fid.1 || fid.1 == 0 {
+            eprintln!("FAIL {}: training fidelity {}/{}", app.id, fid.0, fid.1);
+            return 4;
+        }
+
+        let abstract_name = format!("lgpa-{}-{}", app.id, std::process::id());
+        let _listener = abstract_listener(&abstract_name);
+        let denied_port = free_port();
+        let _tcp = std::net::TcpListener::bind(("127.0.0.1", denied_port));
+        let ctx = Ctx {
+            outside_file: attack_ws.join("secret/canary.txt").to_string_lossy().into(),
+            outside_new: attack_ws
+                .join("outside/escaped.txt")
+                .to_string_lossy()
+                .into(),
+            outside_dir: attack_ws.join("outside").to_string_lossy().into(),
+            // For apps without an obvious ro file, reuse the canary's sibling
+            // under a read-granted path: grant the attack_ws/app path? The
+            // attack suite needs an in-sandbox ro file. We seed one into the
+            // profile by adding the attack workspace data file to ro.
+            ro_file: attack_ws
+                .join("secret/../secret/canary.txt")
+                .to_string_lossy()
+                .into(), // replaced below
+            rw_dir: attack_ws.join("outside").to_string_lossy().into(), // replaced
+            denied_port,
+            denied_bind_port: free_port(),
+            abstract_name,
+        };
+        // Build an attack-friendly overlay: copy a private ro/rw pair into the
+        // profile so the suite's controls work regardless of the app's paths.
+        let mut profile_for_attack = profile.clone();
+        let ro = attack_ws.join("in/ro.txt");
+        let rw = attack_ws.join("in/rw");
+        let _ = std::fs::create_dir_all(&rw);
+        let _ = std::fs::create_dir_all(ro.parent().unwrap());
+        let _ = std::fs::write(&ro, b"ro\n");
+        profile_for_attack.ro.push(ro.to_string_lossy().into());
+        profile_for_attack.rw.push(rw.to_string_lossy().into());
+        // Also allow Execute on the app binary + interp so controls that fork
+        // don't need it; the suite itself does not exec the app.
+        let ctx = Ctx {
+            ro_file: ro.to_string_lossy().into(),
+            rw_dir: rw.to_string_lossy().into(),
+            ..ctx
+        };
+
+        let result = match run_suite(
+            &format!("learned/{}", app.id),
+            &profile_for_attack,
+            &attack_ws,
+            &ctx,
+            fid,
+            None,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FAIL suite {}: {e}", app.id);
+                return 3;
+            }
+        };
+        print_result(&result);
+        rows.push(AppRow {
+            id: app.id.into(),
+            title: app.title.into(),
+            available: true,
+            skipped_reason: None,
+            fidelity_ok: result.fidelity_ok,
+            fidelity_total: result.fidelity_total,
+            valid_attacks: result.valid_attacks,
+            blocked: result.blocked,
+            blocked_pct: result.blocked_pct,
+            escaped_ids: result.escaped_ids.clone(),
+            profile_syscalls: profile.syscalls.len(),
+        });
+    }
+
+    println!("\n======== PER-APP SUMMARY ========");
+    println!(
+        "{:<12} {:>10} {:>12} {:>8}",
+        "app", "fidelity", "blocked%", "syscalls"
+    );
+    let mut worst = 100.0_f64;
+    for r in &rows {
+        if !r.available {
+            println!(
+                "{:<12} {:>10} {:>12}  ({})",
+                r.id,
+                "-",
+                "SKIP",
+                r.skipped_reason.as_deref().unwrap_or("")
+            );
+            continue;
+        }
+        println!(
+            "{:<12} {:>5}/{:<4} {:>11.1}% {:>8}",
+            r.id, r.fidelity_ok, r.fidelity_total, r.blocked_pct, r.profile_syscalls
+        );
+        worst = worst.min(r.blocked_pct);
+    }
+
+    let report = AppsReport {
+        landlock_abi: abi,
+        kernel,
+        catalog_size: attack::catalog().len(),
+        apps: rows,
+        reproduce: "cargo build --release && ./target/release/lgpa measure-apps --ws /tmp/lgpa-apps --json apps.json".into(),
+    };
+    if let Some(j) = json {
+        let _ = std::fs::write(j, serde_json::to_string_pretty(&report).unwrap());
+    }
+    if worst < min_blocked_pct {
+        eprintln!("FAIL: worst app blocked {worst:.1}% < required {min_blocked_pct}%");
         return 5;
     }
     0

@@ -7,6 +7,7 @@ use landlock_genprof_attack::{learn, trace, Profile};
 use std::ffi::CString;
 use std::path::PathBuf;
 
+mod apps;
 mod demo;
 mod report;
 
@@ -56,6 +57,15 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// Measure every available app: learn, fidelity, attack suite per app.
+    MeasureApps {
+        #[arg(long, default_value = "/tmp/lgpa-apps")]
+        ws: PathBuf,
+        #[arg(long)]
+        json: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.0)]
+        min_blocked_pct: f64,
+    },
     /// End-to-end: build a workspace, learn a profile, verify training fidelity,
     /// run the escape suite, and print the metric.
     Measure {
@@ -93,6 +103,11 @@ fn main() {
             no_compare,
             min_blocked_pct,
         } => report::measure(&ws, json, !no_compare, min_blocked_pct),
+        Cmd::MeasureApps {
+            ws,
+            json,
+            min_blocked_pct,
+        } => report::measure_apps(&ws, json, min_blocked_pct),
     };
     std::process::exit(code);
 }

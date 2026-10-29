@@ -121,7 +121,20 @@ pub fn apply_landlock(profile: &Profile) -> Result<(), String> {
 /// Compile the seccomp allowlist (unknown syscalls -> ENOSYS).
 pub fn compile_seccomp(profile: &Profile, extra: &[i64]) -> Result<BpfProgram, String> {
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
-    for n in profile.syscalls.iter().chain(extra.iter()) {
+    // Always allow process-lifetime syscalls. Training traces sometimes miss
+    // exit_group (e.g. a server killed by SIGTERM), and without it the
+    // sandboxed child cannot _exit after the attack body runs.
+    const LIFETIME: &[i64] = &[
+        15,  // rt_sigreturn
+        60,  // exit
+        231, // exit_group
+    ];
+    for n in profile
+        .syscalls
+        .iter()
+        .chain(extra.iter())
+        .chain(LIFETIME.iter())
+    {
         rules.insert(*n, vec![]);
     }
     let filter = SeccompFilter::new(

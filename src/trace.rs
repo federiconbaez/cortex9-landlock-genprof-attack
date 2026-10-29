@@ -3,17 +3,23 @@
 //! We avoid depending on the `strace` binary (it is not always installable and
 //! parsing its text output is brittle). Instead we drive the tracee with
 //! `PTRACE_SYSCALL`, read the argument registers at each syscall-entry stop, and
-//! pull path strings out of `/proc/<pid>/mem`. Only the handful of syscalls that
-//! matter for a Landlock+seccomp profile are decoded; every syscall *number* is
-//! recorded for the seccomp allowlist.
+//! pull path strings out of the tracee's address space via `process_vm_readv(2)`
+//! (more reliable than `/proc/<pid>/mem` under some LSM configs). Only the
+//! handful of syscalls that matter for a Landlock+seccomp profile are decoded;
+//! every syscall *number* is recorded for the seccomp allowlist.
+//!
+//! Fork/vfork/clone are followed via `PTRACE_O_TRACE{FORK,VFORK,CLONE}`, so
+//! multithreaded and multiprocess workloads (e.g. `python3 -m http.server`)
+//! are captured. Each new child is auto-traced; we record its syscalls into
+//! the same Trace.
 
 use crate::{FsAccess, Mode, Trace};
 use nix::sys::ptrace;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::signal::Signal;
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
-use std::os::unix::fs::FileExt;
 
 const O_WRONLY: u64 = 0o1;
 const O_RDWR: u64 = 0o2;
@@ -29,101 +35,144 @@ const SYS_EXECVEAT: u64 = 322;
 const SYS_CONNECT: u64 = 42;
 const SYS_BIND: u64 = 49;
 
-/// Trace `cmd` under ptrace and return the observations.
+/// Optional driver run (on another thread) after the tracee starts, e.g. to
+/// hit a server and then stop it. It receives the tracee's pid.
+pub type Driver = Box<dyn FnOnce(Pid) + Send>;
+
+/// Trace `cmd` under ptrace and return the observations. Follows fork/clone so
+/// multithreaded and multiprocess workloads are captured.
 pub fn trace_command(cmd: &[String]) -> std::io::Result<Trace> {
+    trace_command_driven(cmd, None)
+}
+
+/// Like [`trace_command`] but runs `driver` on a side thread once tracing is
+/// under way (used for server workloads that must be poked and then killed).
+pub fn trace_command_driven(cmd: &[String], driver: Option<Driver>) -> std::io::Result<Trace> {
     if cmd.is_empty() {
         return Err(std::io::Error::other("empty command"));
     }
     match unsafe { fork() }.map_err(std::io::Error::other)? {
         ForkResult::Child => {
             ptrace::traceme().ok();
+            // Stop so the parent can set options before we exec.
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+            }
             let c = CString::new(cmd[0].as_str()).unwrap();
             let args: Vec<CString> = cmd
                 .iter()
                 .map(|a| CString::new(a.as_str()).unwrap())
                 .collect();
             let _ = execvp(&c, &args);
-            // execvp only returns on error.
             unsafe { libc::_exit(127) };
         }
         ForkResult::Parent { child } => {
-            let mut t = parent_loop(child, cmd)?;
-            // The initial execve happens before the first syscall-stop we see
-            // (PTRACE_TRACEME semantics), so record the resolved target here.
-            if let Some(p) = resolve_exe(&cmd[0]) {
-                t.fs.insert(
-                    0,
-                    FsAccess {
-                        path: p,
-                        mode: Mode::Exec,
-                    },
-                );
+            let driver_handle = driver.map(|d| std::thread::spawn(move || d(child)));
+            let t = parent_loop(child, cmd);
+            if let Some(h) = driver_handle {
+                let _ = h.join();
             }
-            // The kernel opens the ELF interpreter (PT_INTERP) or the `#!`
-            // interpreter inside execve without a syscall we can see; Landlock
-            // still checks Execute on it, so derive it from each exec target.
-            let execs: Vec<String> =
-                t.fs.iter()
-                    .filter(|a| a.mode == Mode::Exec)
-                    .map(|a| a.path.clone())
-                    .collect();
-            for e in execs {
-                if let Some(i) = exec_interpreter(&e) {
-                    t.fs.push(FsAccess {
-                        path: i,
-                        mode: Mode::Exec,
-                    });
-                }
-            }
-            dedup(&mut t.fs);
-            Ok(t)
+            t
         }
     }
 }
 
 fn parent_loop(child: Pid, cmd: &[String]) -> std::io::Result<Trace> {
-    waitpid(child, None).map_err(std::io::Error::other)?;
-    ptrace::setoptions(child, ptrace::Options::PTRACE_O_TRACESYSGOOD)
-        .map_err(std::io::Error::other)?;
+    use nix::sys::ptrace::Options;
 
-    let mem = std::fs::File::open(format!("/proc/{child}/mem")).ok();
+    waitpid(child, None).map_err(std::io::Error::other)?;
+    let opts = Options::PTRACE_O_TRACESYSGOOD
+        | Options::PTRACE_O_TRACEFORK
+        | Options::PTRACE_O_TRACEVFORK
+        | Options::PTRACE_O_TRACECLONE
+        | Options::PTRACE_O_EXITKILL;
+    ptrace::setoptions(child, opts).map_err(std::io::Error::other)?;
+
     let mut fs: Vec<FsAccess> = Vec::new();
     let mut syscalls: BTreeSet<i64> = BTreeSet::new();
     let mut bind_ports: BTreeSet<u16> = BTreeSet::new();
     let mut connect_ports: BTreeSet<u16> = BTreeSet::new();
-    let mut at_entry = true;
     let mut exit_code = None;
 
+    let mut at_entry: HashMap<Pid, bool> = HashMap::new();
+    let mut alive: HashSet<Pid> = HashSet::new();
+    at_entry.insert(child, true);
+    alive.insert(child);
+
+    let _ = ptrace::syscall(child, None);
+
     loop {
-        if ptrace::syscall(child, None).is_err() {
-            break;
-        }
-        match waitpid(child, None) {
-            Ok(WaitStatus::Exited(_, code)) => {
-                exit_code = Some(code);
-                break;
+        let status = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL)) {
+            Ok(s) => s,
+            Err(nix::errno::Errno::ECHILD) => break,
+            Err(_) => break,
+        };
+        match status {
+            WaitStatus::Exited(pid, code) => {
+                if pid == child {
+                    exit_code = Some(code);
+                }
+                alive.remove(&pid);
+                if alive.is_empty() {
+                    break;
+                }
             }
-            Ok(WaitStatus::Signaled(_, _, _)) => break,
-            Ok(WaitStatus::PtraceSyscall(_)) => {
-                if at_entry {
-                    if let Ok(regs) = ptrace::getregs(child) {
+            WaitStatus::Signaled(pid, _, _) => {
+                alive.remove(&pid);
+                if alive.is_empty() {
+                    break;
+                }
+            }
+            WaitStatus::PtraceEvent(pid, _, _) => {
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::PtraceSyscall(pid) => {
+                let entry = at_entry.entry(pid).or_insert(true);
+                if *entry {
+                    if let Ok(regs) = ptrace::getregs(pid) {
                         syscalls.insert(regs.orig_rax as i64);
-                        decode(
-                            &regs,
-                            mem.as_ref(),
-                            &mut fs,
-                            &mut bind_ports,
-                            &mut connect_ports,
-                        );
+                        decode(pid, &regs, &mut fs, &mut bind_ports, &mut connect_ports);
                     }
                 }
-                at_entry = !at_entry;
+                *entry = !*entry;
+                let _ = ptrace::syscall(pid, None);
             }
-            Ok(_) => {}
-            Err(_) => break,
+            WaitStatus::Stopped(pid, sig) => {
+                alive.insert(pid);
+                at_entry.entry(pid).or_insert(true);
+                let forward = if sig == Signal::SIGSTOP || sig == Signal::SIGTRAP {
+                    None
+                } else {
+                    Some(sig)
+                };
+                let _ = ptrace::syscall(pid, forward);
+            }
+            _ => {}
         }
     }
 
+    if let Some(p) = resolve_exe(&cmd[0]) {
+        fs.insert(
+            0,
+            FsAccess {
+                path: p,
+                mode: Mode::Exec,
+            },
+        );
+    }
+    let execs: Vec<String> = fs
+        .iter()
+        .filter(|a| a.mode == Mode::Exec)
+        .map(|a| a.path.clone())
+        .collect();
+    for e in execs {
+        if let Some(i) = exec_interpreter(&e) {
+            fs.push(FsAccess {
+                path: i,
+                mode: Mode::Exec,
+            });
+        }
+    }
     dedup(&mut fs);
     Ok(Trace {
         cmd: cmd.to_vec(),
@@ -135,18 +184,16 @@ fn parent_loop(child: Pid, cmd: &[String]) -> std::io::Result<Trace> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode(
+    pid: Pid,
     regs: &libc::user_regs_struct,
-    mem: Option<&std::fs::File>,
     fs: &mut Vec<FsAccess>,
     bind_ports: &mut BTreeSet<u16>,
     connect_ports: &mut BTreeSet<u16>,
 ) {
-    let Some(mem) = mem else { return };
     match regs.orig_rax {
         SYS_OPEN => {
-            if let Some(p) = read_cstr(mem, regs.rdi) {
+            if let Some(p) = read_cstr(pid, regs.rdi) {
                 let mode = if regs.rsi & WRITE_BITS != 0 {
                     Mode::Write
                 } else {
@@ -156,7 +203,7 @@ fn decode(
             }
         }
         SYS_OPENAT => {
-            if let Some(p) = read_cstr(mem, regs.rsi) {
+            if let Some(p) = read_cstr(pid, regs.rsi) {
                 let mode = if regs.rdx & WRITE_BITS != 0 {
                     Mode::Write
                 } else {
@@ -166,9 +213,8 @@ fn decode(
             }
         }
         SYS_OPENAT2 => {
-            // struct open_how { __u64 flags; __u64 mode; __u64 resolve; }
-            if let Some(p) = read_cstr(mem, regs.rsi) {
-                let flags = read_u64(mem, regs.rdx).unwrap_or(0);
+            if let Some(p) = read_cstr(pid, regs.rsi) {
+                let flags = read_u64(pid, regs.rdx).unwrap_or(0);
                 let mode = if flags & WRITE_BITS != 0 {
                     Mode::Write
                 } else {
@@ -178,22 +224,22 @@ fn decode(
             }
         }
         SYS_EXECVE => {
-            if let Some(p) = read_cstr(mem, regs.rdi) {
+            if let Some(p) = read_cstr(pid, regs.rdi) {
                 push(fs, p, Mode::Exec);
             }
         }
         SYS_EXECVEAT => {
-            if let Some(p) = read_cstr(mem, regs.rsi) {
+            if let Some(p) = read_cstr(pid, regs.rsi) {
                 push(fs, p, Mode::Exec);
             }
         }
         SYS_BIND => {
-            if let Some(port) = read_port(mem, regs.rsi, regs.rdx) {
+            if let Some(port) = read_port(pid, regs.rsi, regs.rdx) {
                 bind_ports.insert(port);
             }
         }
         SYS_CONNECT => {
-            if let Some(port) = read_port(mem, regs.rsi, regs.rdx) {
+            if let Some(port) = read_port(pid, regs.rsi, regs.rdx) {
                 connect_ports.insert(port);
             }
         }
@@ -208,46 +254,67 @@ fn push(fs: &mut Vec<FsAccess>, path: String, mode: Mode) {
     fs.push(FsAccess { path, mode });
 }
 
-fn read_cstr(mem: &std::fs::File, addr: u64) -> Option<String> {
+/// Read up to `len` bytes from `pid` at `addr` via process_vm_readv.
+fn vm_read(pid: Pid, addr: u64, len: usize) -> Option<Vec<u8>> {
+    if addr == 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut _,
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut _,
+        iov_len: len,
+    };
+    let n = unsafe { libc::process_vm_readv(pid.as_raw(), &local, 1, &remote, 1, 0) };
+    if n < 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+fn read_cstr(pid: Pid, addr: u64) -> Option<String> {
     if addr == 0 {
         return None;
     }
+    // Read in chunks; stop at NUL.
     let mut out = Vec::new();
-    let mut buf = [0u8; 256];
     let mut off = addr;
-    loop {
-        let n = mem.read_at(&mut buf, off).ok()?;
-        if n == 0 {
+    while out.len() < 4096 {
+        let chunk = vm_read(pid, off, 256)?;
+        if chunk.is_empty() {
             break;
         }
-        for &b in &buf[..n] {
+        for &b in &chunk {
             if b == 0 {
                 return String::from_utf8(out).ok();
             }
             out.push(b);
-            if out.len() > 4096 {
-                return String::from_utf8(out).ok();
-            }
         }
-        off += n as u64;
+        off += chunk.len() as u64;
     }
     String::from_utf8(out).ok()
 }
 
-fn read_u64(mem: &std::fs::File, addr: u64) -> Option<u64> {
-    let mut buf = [0u8; 8];
-    mem.read_at(&mut buf, addr).ok()?;
-    Some(u64::from_ne_bytes(buf))
+fn read_u64(pid: Pid, addr: u64) -> Option<u64> {
+    let buf = vm_read(pid, addr, 8)?;
+    if buf.len() < 8 {
+        return None;
+    }
+    Some(u64::from_ne_bytes(buf[..8].try_into().ok()?))
 }
 
-/// Parse the port out of a `sockaddr_in`/`sockaddr_in6` (both carry the port in
-/// bytes 2..4, network byte order). Returns None for AF_UNIX etc.
-fn read_port(mem: &std::fs::File, addr: u64, len: u64) -> Option<u16> {
+fn read_port(pid: Pid, addr: u64, len: u64) -> Option<u16> {
     if addr == 0 || len < 4 {
         return None;
     }
-    let mut buf = [0u8; 4];
-    mem.read_at(&mut buf, addr).ok()?;
+    let buf = vm_read(pid, addr, 4)?;
+    if buf.len() < 4 {
+        return None;
+    }
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     if family != libc::AF_INET as u16 && family != libc::AF_INET6 as u16 {
         return None;
@@ -324,7 +391,6 @@ mod tests {
     fn interp_of_running_binary() {
         let exe = std::env::current_exe().unwrap();
         let i = exec_interpreter(exe.to_str().unwrap());
-        // Test binaries are dynamically linked on glibc runners.
         assert!(i.as_deref().unwrap_or("").contains("ld-linux"), "{i:?}");
     }
 
@@ -342,5 +408,26 @@ mod tests {
     #[test]
     fn non_elf_has_no_interp() {
         assert_eq!(elf_interp(b"not an elf"), None);
+    }
+
+    #[test]
+    fn follows_fork_and_captures_child_syscalls() {
+        let dir = std::env::temp_dir().join(format!("lgpa-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("from-child.txt");
+        std::fs::write(&marker, b"x").unwrap();
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("cat {} > /dev/null", marker.display()),
+        ];
+        let t = trace_command(&cmd).unwrap();
+        assert!(
+            t.fs.iter().any(|a| a.path.contains("from-child")),
+            "child open not recorded: {:?}",
+            t.fs
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
