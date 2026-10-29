@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: kernel
+        run: uname -a
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        # The integration tests run against the real kernel and FAIL (never
+        # skip) if Landlock ABI < 6 is unavailable.
+        run: cargo test --workspace
+
+  measure:
+    name: medición (Landlock real, falla si no hay ABI 6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: kernel + Landlock ABI
+        run: |
+          uname -a
+          cargo build --release
+          ./target/release/lgpa abi
+      - name: reproducir medición
+        run: ./target/release/lgpa measure --ws /tmp/lgpa-ws --json report.json --min-blocked-pct 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lgpa-report
+          path: report.json
